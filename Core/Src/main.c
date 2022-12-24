@@ -1,4 +1,6 @@
 /* USER CODE BEGIN Header */
+
+
 /**
   ******************************************************************************
   * @file           : main.c
@@ -31,8 +33,11 @@
 #include <rmw_microxrcedds_c/config.h>
 #include <rmw_microros/rmw_microros.h>
 
+#include <std_msgs/msg/u_int16.h>
+#include <std_msgs/msg/float32.h>
 #include <std_msgs/msg/string.h>
 #include <sensor_msgs/msg/imu.h>
+#include <geometry_msgs/msg/twist.h>>
 
 #include <stdio.h>
 #include <string.h>
@@ -48,20 +53,37 @@
 #define ARRAY_LEN 200
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){printf("Failed status on line %d: %d. Aborting.\n",__LINE__,(int)temp_rc); return 1;}}
 #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){printf("Failed status on line %d: %d. Continuing.\n",__LINE__,(int)temp_rc);}}
+
+#define PI 3.1415926535
+
+#define WHEEL_DIA 0.07	/*[m]*/
+#define TREAD 0.195 /*[m]*/
+
+#define GEAR_RATIO 70
+#define CPR 64 			/*Count per rotation*/
+
+const float move_per_pulse = (WHEEL_DIA * PI) / (CPR * GEAR_RATIO); /*[m]*/
+const float sampling_time = 0.02; /*0.02[s]*/
+
+double left_wheel_speed = 0.0;
+double right_wheel_speed = 0.0;
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-rcl_publisher_t publisher_string;
-rcl_publisher_t publisher_imu;
-std_msgs__msg__String pub_str_msg;
-sensor_msgs__msg__Imu pub_imu_msg;
+geometry_msgs__msg__Twist twist_msg;
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim7;
+
 UART_HandleTypeDef huart2;
-DMA_HandleTypeDef hdma_usart2_tx;
 DMA_HandleTypeDef hdma_usart2_rx;
+DMA_HandleTypeDef hdma_usart2_tx;
 
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
@@ -79,6 +101,11 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_TIM6_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM7_Init(void);
+static void MX_TIM1_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
@@ -87,24 +114,10 @@ void StartDefaultTask(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void subscription_str_callback(const void * msgin)
+void subscription_twist_callback(const void * msgin)
 {
-  std_msgs__msg__String * msg = (std_msgs__msg__String *)msgin;
-  pub_str_msg = *msg;
-  char str[100];
-  strcpy(str, msg->data.data);
-  sprintf(pub_str_msg.data.data, "F446RE heard: %s", str);
-  pub_str_msg.data.size = strlen(pub_str_msg.data.data);
-  rcl_publish(&publisher_string, &pub_str_msg, NULL);
-  debug_led();
-}
-
-void subscription_imu_callback(const void * msgin)
-{
-  sensor_msgs__msg__Imu * msg = (sensor_msgs__msg__Imu *)msgin;
-  pub_imu_msg = *msg;
-  rcl_publish(&publisher_imu, &pub_imu_msg, NULL);
-  debug_led();
+  geometry_msgs__msg__Twist * msg = (geometry_msgs__msg__Twist *)msgin;
+  twist_msg = *msg;
 }
 
 void debug_led()
@@ -113,6 +126,104 @@ void debug_led()
   HAL_Delay(200); //Wait for 200[ms]
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET); //LED turned off
   HAL_Delay(200);
+}
+
+double low_pass_filter(double val, float pre_val, float gamma){
+	return gamma * pre_val + (1.0 - gamma) * val;
+}
+
+int get_left_encoder(void){
+	int16_t count = 0;
+	uint16_t enc_buff = TIM3 -> CNT;
+
+	TIM3 -> CNT = 0;
+
+	if(enc_buff > 32767){
+		count = (int16_t)enc_buff * -1; //-1倍はCWがプラスになるよう調整用
+	}else{
+		count = (int16_t)enc_buff * -1; //-1倍はCCWがマイナスになるよう調整用
+	}
+	return count;
+}
+
+int get_right_encoder(void){
+	int16_t count = 0;
+	uint16_t enc_buff = TIM1 -> CNT;
+
+	TIM1 -> CNT = 0;
+
+	if(enc_buff > 32767){
+		count = (int16_t)enc_buff; //-1倍はCWがプラスになるよう調整用
+	}else{
+		count = (int16_t)enc_buff; //-1倍はCCWがマイナスになるよう調整用
+	}
+	return count;
+}
+
+double i_left = 0.0; //i制御用変数
+double i_right = 0.0;
+double left_wheel_dir = 0.0;
+double right_wheel_dir = 0.0;
+double kp_left = 8000, kp_right = 8000; //P制御ゲイン
+double ki_left = 500, ki_right = 500; //I制御ゲイン
+double ref_left_wheel_speed = 0.0; //左車輪目標速度
+double ref_right_wheel_speed = 0.0; //右車輪目標速度
+
+char scnt[200];
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+	//タイマー割り込みコールバック関数
+	if(htim == &htim7){ //タイヤの速度計算(Timer10割り込み処理)
+		HAL_GPIO_TogglePin(LD2_GPIO_Port,LD2_Pin);
+
+		ref_left_wheel_speed  = twist_msg.linear.x + (TREAD/2) * twist_msg.angular.z;
+		ref_right_wheel_speed = twist_msg.linear.x - (TREAD/2) * twist_msg.angular.z;
+
+		double left_wheel_speed_tmp = (move_per_pulse * get_left_encoder()) / sampling_time;
+		double right_wheel_speed_tmp = (move_per_pulse * get_right_encoder()) / sampling_time;
+
+		left_wheel_speed = low_pass_filter(left_wheel_speed, left_wheel_speed_tmp, 0.5);
+		right_wheel_speed = low_pass_filter(right_wheel_speed, right_wheel_speed_tmp, 0.5);
+
+		double delta_left_wheel_speed = -ref_left_wheel_speed + left_wheel_speed;
+		double delta_right_wheel_speed = ref_right_wheel_speed - right_wheel_speed;
+
+		if(ref_left_wheel_speed == 0.0){
+			i_left = 0;
+		}else{
+			i_left += delta_left_wheel_speed * sampling_time;
+		}
+
+		if(ref_right_wheel_speed == 0.0){
+			i_right = 0;
+		}else{
+			i_right += delta_right_wheel_speed * sampling_time;
+		}
+
+		left_wheel_dir = kp_left * delta_left_wheel_speed  + ki_left * i_left;
+		right_wheel_dir = kp_right * delta_right_wheel_speed + ki_right * i_right;
+
+		if(left_wheel_dir > 0){
+			if(left_wheel_dir>999) left_wheel_dir = 999;
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
+			__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (int)(fabs(left_wheel_dir)));
+		}else{
+			if(left_wheel_dir<-999) left_wheel_dir = 999;
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
+			__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (int)(fabs(left_wheel_dir)));
+		}
+
+		if(right_wheel_dir > 0){
+			if(right_wheel_dir>999) right_wheel_dir = 999;
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
+			__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, (int)(fabs(right_wheel_dir)));
+		}else{
+			if(right_wheel_dir<-999) right_wheel_dir = 999;
+			HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);
+			__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, (int)(fabs(right_wheel_dir)));
+		}
+	}
 }
 /* USER CODE END 0 */
 
@@ -146,8 +257,18 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART2_UART_Init();
+  MX_TIM3_Init();
+  MX_TIM6_Init();
+  MX_TIM2_Init();
+  MX_TIM7_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
-
+  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
+  HAL_TIM_Encoder_Start(&htim1, TIM_CHANNEL_ALL);
+  HAL_TIM_Base_Start_IT(&htim6);
+  HAL_TIM_Base_Start_IT(&htim7);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -189,6 +310,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	 HAL_Delay( 100 );
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -209,6 +331,7 @@ void SystemClock_Config(void)
   */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
@@ -226,6 +349,7 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
   /** Initializes the CPU, AHB and APB buses clocks
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
@@ -239,6 +363,236 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 65535;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 84-1;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 1000-1;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  __HAL_TIM_DISABLE_OCxPRELOAD(&htim2, TIM_CHANNEL_1);
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  __HAL_TIM_DISABLE_OCxPRELOAD(&htim2, TIM_CHANNEL_2);
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+  HAL_TIM_MspPostInit(&htim2);
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 65535;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 8400-1;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 200-1;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
+
+}
+
+/**
+  * @brief TIM7 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM7_Init(void)
+{
+
+  /* USER CODE BEGIN TIM7_Init 0 */
+
+  /* USER CODE END TIM7_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM7_Init 1 */
+
+  /* USER CODE END TIM7_Init 1 */
+  htim7.Instance = TIM7;
+  htim7.Init.Prescaler = 8400-1;
+  htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim7.Init.Period = 200-1;
+  htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM7_Init 2 */
+
+  /* USER CODE END TIM7_Init 2 */
+
 }
 
 /**
@@ -312,7 +666,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6|GPIO_PIN_8, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
@@ -327,12 +681,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PB2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  /*Configure GPIO pins : PC6 PC8 */
+  GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_8;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
 }
 
@@ -381,9 +735,8 @@ void StartDefaultTask(void *argument)
     printf("Error on default allocators (line %d)\n", __LINE__);
   }
 
-  rcl_subscription_t subscriber_string, subscriber_imu;
-  std_msgs__msg__String sub_str_msg;
-  sensor_msgs__msg__Imu sub_imu_msg;
+  rcl_subscription_t subscriber_twist;
+  geometry_msgs__msg__Twist sub_twist_msg;
   rclc_support_t support;
   rcl_allocator_t allocator;
   rcl_node_t node;
@@ -396,86 +749,25 @@ void StartDefaultTask(void *argument)
   // create node
   RCCHECK(rclc_node_init_default(&node, "f446re_node", "", &support));
 
-  // create publisher
-  RCCHECK(rclc_publisher_init_best_effort(
-    &publisher_string,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-    "/f446re_string_publisher"));
-
-  RCCHECK(rclc_publisher_init_best_effort(
-    &publisher_imu,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
-    "/f446re_imu_publisher"));
-
   // create subscriber
-  RCCHECK(rclc_subscription_init_default(
-    &subscriber_string,
+	RCCHECK(rclc_subscription_init_default(
+    &subscriber_twist,
     &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-    "/f446re_string_subscriber"));
-
-  RCCHECK(rclc_subscription_init_default(
-    &subscriber_imu,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
-    "/imu/data_raw"));
+    ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+    "/cmd_vel"));
 
   // create executor
   rclc_executor_t executor = rclc_executor_get_zero_initialized_executor();
-  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
-  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber_string, &sub_str_msg, &subscription_str_callback, ON_NEW_DATA));
-  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber_imu, &sub_imu_msg, &subscription_imu_callback, ON_NEW_DATA));
-
-  // initialize message memory
-  pub_str_msg.data.data = (char * ) malloc(ARRAY_LEN * sizeof(char));
-  pub_str_msg.data.size = 0;
-  pub_str_msg.data.capacity = ARRAY_LEN;
-
-  pub_imu_msg.header.frame_id.capacity = 100;
-  pub_imu_msg.header.frame_id.data =(char * ) malloc(100 * sizeof(char));
-  pub_imu_msg.header.frame_id.size = 0;
-
-  sub_str_msg.data.data = (char * ) malloc(ARRAY_LEN * sizeof(char));
-  sub_str_msg.data.size = 0;
-  sub_str_msg.data.capacity = ARRAY_LEN;
-
-  sub_imu_msg.header.frame_id.capacity = 100;
-  sub_imu_msg.header.frame_id.data =(char * ) malloc(100 * sizeof(char));
-  sub_imu_msg.header.frame_id.size = 0;
+  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber_twist, &sub_twist_msg, &subscription_twist_callback, ON_NEW_DATA));
 
   // execute subscriber
   rclc_executor_spin(&executor);
 
   // cleaning Up
-  RCCHECK(rcl_publisher_fini(&publisher_string, &node));
-  RCCHECK(rcl_publisher_fini(&publisher_imu, &node));
-  RCCHECK(rcl_subscription_fini(&subscriber_string, &node));
-  RCCHECK(rcl_subscription_fini(&subscriber_imu, &node));
+  RCCHECK(rcl_subscription_fini(&subscriber_twist, &node));
   RCCHECK(rcl_node_fini(&node));
   /* USER CODE END 5 */
-}
-
- /**
-  * @brief  Period elapsed callback in non blocking mode
-  * @note   This function is called  when TIM6 interrupt took place, inside
-  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
-  * a global variable "uwTick" used as application time base.
-  * @param  htim : TIM handle
-  * @retval None
-  */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-  /* USER CODE BEGIN Callback 0 */
-
-  /* USER CODE END Callback 0 */
-  if (htim->Instance == TIM6) {
-    HAL_IncTick();
-  }
-  /* USER CODE BEGIN Callback 1 */
-
-  /* USER CODE END Callback 1 */
 }
 
 /**
@@ -509,5 +801,3 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
-
-/************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/
